@@ -12,7 +12,6 @@ Authors
 import torch
 import torch.nn.functional as F
 from torch import nn
-import speechbrain as sb
 
 # We check if transformers is installed.
 try:
@@ -24,9 +23,10 @@ except ImportError:
 # For uniform initialization
 BOUND = 0.02
 
+
 class HuggingFaceWav2Vec2MultiLayer(nn.Module):
     """This lobe enables the integration of HuggingFace
-    pretrained wav2vec2.0 models. 
+    pretrained wav2vec2.0 models.
 
     Source paper: https://arxiv.org/abs/2006.11477
     Transformer from HuggingFace needs to be installed:
@@ -63,7 +63,14 @@ class HuggingFaceWav2Vec2MultiLayer(nn.Module):
     """
 
     def __init__(
-        self, source, save_path, output_norm=True, freeze=True, re_init_from_nth_layers=None, return_nth_layer=-1, use_coef=False):
+        self,
+        source,
+        save_path,
+        freeze=True,
+        re_init_from_nth_layer=None,
+        return_nth_layer=-1,
+        use_coef=False,
+    ):
         super().__init__()
 
         # Download the extractor from HuggingFace.
@@ -73,9 +80,7 @@ class HuggingFaceWav2Vec2MultiLayer(nn.Module):
         )
 
         # Download the model from HuggingFace.
-        self.model = Wav2Vec2Model.from_pretrained(
-            source, cache_dir=save_path
-        )
+        self.model = Wav2Vec2Model.from_pretrained(source, cache_dir=save_path)
 
         # We check if inputs need to be normalized w.r.t pretrained wav2vec2
         self.normalize_wav = self.feature_extractor.do_normalize
@@ -83,34 +88,47 @@ class HuggingFaceWav2Vec2MultiLayer(nn.Module):
         # Make the model return multiple layers
         self.model.config.output_hidden_states = True
         self.hidden_size = self.model.config.hidden_size
-        self.hidden_layers = self.model.config.num_hidden_layers + 1
+        self.num_hidden_layers = self.model.config.num_hidden_layers
+        self.num_hidden_states = self.model.config.num_hidden_layers + 1
 
         # coefficient for each layers
         self.use_coef = use_coef
         if self.use_coef:
-            self.coef_param = nn.Parameter(torch.Tensor(self.hidden_layers))
+            self.coef_param = nn.Parameter(torch.Tensor(self.num_hidden_states))
             nn.init.uniform_(self.coef_param, -BOUND, BOUND)
             self.softmax = nn.Softmax(dim=0)
 
         if self.use_coef and return_nth_layer != -1:
-            raise ValueError("When using coefficient, the model will return the mixture of multiple layers.")
+            raise ValueError(
+                "When using coefficient, the model will return the mixture of multiple layers."
+            )
 
-        self.return_nth_layer = return_nth_layer
-        self.re_init_from_nth_layers = re_init_from_nth_layers
+        self.return_nth_layer = (
+            return_nth_layer + self.num_hidden_states
+            if return_nth_layer < 0
+            else return_nth_layer
+        )
 
-        # Randomly initialized layers if pretrain is False
-        if not (pretrain):
-            self.reset_layer(self.model)
+        # Randomly initialized layers if re_init_from_nth_layer is not None
+        if re_init_from_nth_layer is not None:
+            self.re_init_from_nth_layer = (
+                re_init_from_nth_layer + self.num_hidden_layers
+                if re_init_from_nth_layer < 0
+                else re_init_from_nth_layer
+            )
+
+            self.reset_layers(self.model, self.re_init_from_nth_layer)
 
         # We check if inputs need to be normalized w.r.t pretrained wav2vec2
-        self.normalize_wav = self.proc.feature_extractor.do_normalize
+        self.normalize_wav = self.feature_extractor.do_normalize
 
         self.freeze = freeze
-        self.output_norm = output_norm
-        if self.freeze:
-            self.model.eval()
-        else:
-            self.model.train()
+        if freeze:
+            if re_init_from_nth_layer is None:
+                self.freeze_layers(self.model, self.num_hidden_layers)
+            else:
+                # if re-init some layers, then don't freeze them
+                self.freeze_layers(self.model, self.re_init_from_nth_layer)
 
     def forward(self, wav):
         """Takes an input waveform and return its corresponding wav2vec encoding.
@@ -120,11 +138,6 @@ class HuggingFaceWav2Vec2MultiLayer(nn.Module):
         wav : torch.Tensor (signal)
             A batch of audio signals to transform to features.
         """
-
-        # If we freeze, we simply remove all grads and features from the graph.
-        if self.freeze:
-            with torch.no_grad():
-                return self.extract_features(wav).detach()
 
         return self.extract_features(wav)
 
@@ -141,24 +154,31 @@ class HuggingFaceWav2Vec2MultiLayer(nn.Module):
             wav = F.layer_norm(wav, wav.shape)
 
         # Extract wav2vec output for each layers
-        out = torch.stack(self.model(wav)[1], dim=2)
+        out = self.model(wav)[1]
 
-        # We normalize the output if required
-        if self.output_norm:
-            out = F.layer_norm(out, out.shape)
+        if not self.use_coef:
+            print(f"return #{self.return_nth_layer} layer")
+            return out[self.return_nth_layer]
+        else:
+            out = torch.stack(out, dim=2)
+            coef = self.softmax(self.coef_param).view(
+                1, 1, self.num_hidden_states, 1
+            )
+            mix = torch.sum(coef * out, dim=2)
+            return mix
 
-        coef = self.softmax(self.coef_param).view(1, 1, self.hidden_layers, 1)
-        mix = torch.sum(coef * out, dim=2)
+    def reset_layers(self, model, from_nth_layer):
+        """Reinitializes part of the parameters of the network"""
+        print(f"reset from {from_nth_layer}")
+        for layer in model.encoder.layers[from_nth_layer:]:
+            layer.apply(model._init_weights)
 
-        return mix
+    def freeze_layers(self, model, until_nth_layer):
+        print(f"freeze until {until_nth_layer}")
+        for layer in model.encoder.layers[:until_nth_layer]:
+            for p in layer.parameters():
+                p.requires_grad = False
 
-    def reset_layer(self, model):
-        """Reinitializes the parameters of the network"""
-        if hasattr(model, "reset_parameters"):
-            model.reset_parameters()
-        for child_layer in model.children():
-            if model != child_layer:
-                self.reset_layer(child_layer)
 
 class HuggingFaceWav2Vec2(nn.Module):
     """This lobe enables the integration of HuggingFace
