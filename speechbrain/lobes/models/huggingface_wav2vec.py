@@ -21,7 +21,10 @@ try:
 except ImportError:
     print("Please install transformer from HuggingFace to use wav2vec2!")
 
-class HuggingFaceWav2Vec2LayerMix(nn.Module):
+# For uniform initialization
+BOUND = 0.02
+
+class HuggingFaceWav2Vec2MultiLayer(nn.Module):
     """This lobe enables the integration of HuggingFace
     pretrained wav2vec2.0 models. 
 
@@ -60,16 +63,22 @@ class HuggingFaceWav2Vec2LayerMix(nn.Module):
     """
 
     def __init__(
-        self, source, save_path, output_norm=True, freeze=True, pretrain=True, bound=0.1
-    ):
+        self, source, save_path, output_norm=True, freeze=True, re_init_from_nth_layers=None, return_nth_layer=-1, use_coef=False):
         super().__init__()
 
-        # Download the model from HuggingFace and load it.
-        # The Processor is only used to retrieve the normalisation
-        self.proc = Wav2Vec2Processor.from_pretrained(
+        # Download the extractor from HuggingFace.
+        # The extractor is only used to retrieve the normalisation
+        self.feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
             source, cache_dir=save_path
         )
-        self.model = Wav2Vec2Model.from_pretrained(source, cache_dir=save_path)
+
+        # Download the model from HuggingFace.
+        self.model = Wav2Vec2Model.from_pretrained(
+            source, cache_dir=save_path
+        )
+
+        # We check if inputs need to be normalized w.r.t pretrained wav2vec2
+        self.normalize_wav = self.feature_extractor.do_normalize
 
         # Make the model return multiple layers
         self.model.config.output_hidden_states = True
@@ -77,9 +86,17 @@ class HuggingFaceWav2Vec2LayerMix(nn.Module):
         self.hidden_layers = self.model.config.num_hidden_layers + 1
 
         # coefficient for each layers
-        self.coef_param = nn.Parameter(torch.Tensor(self.hidden_layers))
-        nn.init.uniform_(self.coef_param, -bound, bound)
-        self.softmax = nn.Softmax(dim=0)
+        self.use_coef = use_coef
+        if self.use_coef:
+            self.coef_param = nn.Parameter(torch.Tensor(self.hidden_layers))
+            nn.init.uniform_(self.coef_param, -BOUND, BOUND)
+            self.softmax = nn.Softmax(dim=0)
+
+        if self.use_coef and return_nth_layer != -1:
+            raise ValueError("When using coefficient, the model will return the mixture of multiple layers.")
+
+        self.return_nth_layer = return_nth_layer
+        self.re_init_from_nth_layers = re_init_from_nth_layers
 
         # Randomly initialized layers if pretrain is False
         if not (pretrain):
