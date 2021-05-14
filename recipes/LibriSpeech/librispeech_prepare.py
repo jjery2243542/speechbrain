@@ -37,6 +37,7 @@ def prepare_librispeech(
     merge_name=None,
     create_lexicon=False,
     skip_prep=False,
+    sample_subsets=False,
 ):
     """
     This class prepares the csv files for the LibriSpeech dataset.
@@ -105,6 +106,9 @@ def prepare_librispeech(
     # Additional checks to make sure the data folder contains Librispeech
     check_librispeech_folders(data_folder, splits)
 
+    spk_path = os.path.join(data_folder, "SPEAKERS.TXT")
+    spk_info = read_speaker_file(spk_path)
+
     # create csv files for each split
     all_texts = {}
     for split_index in range(len(splits)):
@@ -137,6 +141,21 @@ def prepare_librispeech(
         merge_csvs(
             data_folder=save_folder, csv_lst=merge_files, merged_csv=merge_name,
         )
+
+    # Sample subsets
+    if sample_subsets:
+        if "train-clean-100" in tr_splits and "train-other-500" in tr_splits:
+            sample_from_subset(
+                save_folder,
+                "train-clean-100",
+                "train-other-500",
+                spk_info,
+                prefix="train",
+            )
+        if "dev-clean" in dev_splits and "dev-other" in dev_splits:
+            sample_from_subset(
+                save_folder, "dev-clean", "dev-other", spk_info, prefix="dev"
+            )
 
     # Create lexicon.csv and oov.csv
     if create_lexicon:
@@ -287,14 +306,14 @@ def create_csv(
     msg = "Creating csv lists in  %s..." % (csv_file)
     logger.info(msg)
 
-    csv_lines = [["ID", "duration", "wav", "spk_id", "wrd"]]
+    csv_lines = [["ID", "duration", "wav", "spk_id", "wrd", "char"]]
 
     snt_cnt = 0
     # Processing all the wav files in wav_lst
     for wav_file in wav_lst:
 
         snt_id = wav_file.split("/")[-1].replace(".flac", "")
-        spk_id = "-".join(snt_id.split("-")[0:2])
+        spk_id = snt_id.split("-")[0]
         wrds = text_dict[snt_id]
 
         signal, fs = torchaudio.load(wav_file)
@@ -307,6 +326,7 @@ def create_csv(
             wav_file,
             spk_id,
             str(" ".join(wrds.split("_"))),
+            " ".join(wrds),
         ]
 
         #  Appending current file to the csv_lines list
@@ -423,3 +443,75 @@ def check_librispeech_folders(data_folder, splits):
                 "Librispeech dataset)" % split_folder
             )
             raise OSError(err_msg)
+
+
+def read_speaker_file(spk_path):
+    spk_info = {}
+    with open(spk_path, "r") as f:
+        for line in f:
+            if line[0] == ";":
+                continue
+            data = [col.strip() for col in line.split("|")]
+            spk_info[data[0]] = data[1]
+    return spk_info
+
+
+def sample_from_subset(
+    save_folder,
+    clean_split,
+    noisy_split,
+    spk_info,
+    sample_time=[600, 3600, 36000],
+    prefix=None,
+):
+    clean_csv = os.path.join(save_folder, clean_split + ".csv")
+    noisy_csv = os.path.join(save_folder, noisy_split + ".csv")
+
+    # Roughly half female half male, and roughly half clean half noisy
+    four_sets = {"clean_F": [], "clean_M": [], "noisy_F": [], "noisy_M": []}
+    with open(clean_csv) as clean_csv_file:
+        clean_set = csv.DictReader(clean_csv_file)
+        # Store fieldname
+        fieldnames = clean_set.fieldnames
+        for row in clean_set:
+            if spk_info[row["spk_id"]] == "F":
+                four_sets["clean_F"].append(row)
+            elif spk_info[row["spk_id"]] == "M":
+                four_sets["clean_M"].append(row)
+
+    with open(noisy_csv) as noisy_csv_file:
+        noisy_set = csv.DictReader(noisy_csv_file)
+        for row in noisy_set:
+            if spk_info[row["spk_id"]] == "F":
+                four_sets["noisy_F"].append(row)
+            elif spk_info[row["spk_id"]] == "M":
+                four_sets["noisy_M"].append(row)
+
+    for key in four_sets:
+        random.shuffle(four_sets[key])
+
+    total_time, csv_rows = 0, []
+    csv_index = 0
+    csv_names = ["10m.csv", "1h.csv", "10h.csv"]
+    for i in range(min([len(four_sets[key]) for key in four_sets])):
+        if csv_index >= len(sample_time):
+            break
+        for key in four_sets:
+            row = four_sets[key][i]
+            csv_rows.append(row)
+            total_time += float(row["duration"])
+            if total_time >= sample_time[csv_index]:
+                # Writing the csv_lines
+                if prefix is not None:
+                    csv_file = os.path.join(
+                        save_folder, f"{prefix}-{csv_names[csv_index]}"
+                    )
+                else:
+                    csv_file = os.path.join(save_folder, csv_names[csv_index])
+                with open(csv_file, mode="w") as csv_f:
+                    csv_writer = csv.DictWriter(csv_f, fieldnames=fieldnames)
+                    csv_writer.writeheader()
+                    for row in csv_rows:
+                        csv_writer.writerow(row)
+                csv_index += 1
+                break

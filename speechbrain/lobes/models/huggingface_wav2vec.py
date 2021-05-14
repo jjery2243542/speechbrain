@@ -70,6 +70,11 @@ class HuggingFaceWav2Vec2MultiLayer(nn.Module):
         re_init_from_nth_layer=None,
         return_nth_layer=-1,
         use_coef=False,
+        apply_spec_augment=True,
+        mask_time_prob=0.075,
+        mask_time_length=10,
+        mask_feature_prob=0.2,
+        mask_feature_length=64,
     ):
         super().__init__()
 
@@ -82,8 +87,20 @@ class HuggingFaceWav2Vec2MultiLayer(nn.Module):
         # Download the model from HuggingFace.
         self.model = Wav2Vec2Model.from_pretrained(source, cache_dir=save_path)
 
+        # Freeze feature extractor
+        for p in self.model.feature_extractor.parameters():
+            p.requires_grad = False
+
         # We check if inputs need to be normalized w.r.t pretrained wav2vec2
         self.normalize_wav = self.feature_extractor.do_normalize
+
+        # Parameters for specaug
+        self.model.config.apply_spec_augment = apply_spec_augment
+        self.model.config.mask_time_prob = mask_time_prob
+        self.model.config.mask_time_length = mask_time_length
+        self.model.config.mask_feature_prob = mask_feature_prob
+        self.model.config.mask_feature_length = mask_feature_length
+        self.model.config.layerdrop = 0.0
 
         # Make the model return multiple layers
         self.model.config.output_hidden_states = True
@@ -157,7 +174,6 @@ class HuggingFaceWav2Vec2MultiLayer(nn.Module):
         out = self.model(wav)[1]
 
         if not self.use_coef:
-            print(f"return #{self.return_nth_layer} layer")
             return out[self.return_nth_layer]
         else:
             out = torch.stack(out, dim=2)
@@ -169,12 +185,10 @@ class HuggingFaceWav2Vec2MultiLayer(nn.Module):
 
     def reset_layers(self, model, from_nth_layer):
         """Reinitializes part of the parameters of the network"""
-        print(f"reset from {from_nth_layer}")
         for layer in model.encoder.layers[from_nth_layer:]:
             layer.apply(model._init_weights)
 
     def freeze_layers(self, model, until_nth_layer):
-        print(f"freeze until {until_nth_layer}")
         for layer in model.encoder.layers[:until_nth_layer]:
             for p in layer.parameters():
                 p.requires_grad = False

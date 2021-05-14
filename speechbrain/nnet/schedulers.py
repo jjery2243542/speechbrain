@@ -247,6 +247,201 @@ class StepScheduler:
 
 
 @checkpoints.register_checkpoint_hooks
+class TriStageScheduler:
+    """The is an implementation of the transformer's learning rate scheduler with warmup.
+    Reference: https://arxiv.org/abs/1706.03762
+
+    Note: this scheduler anneals the lr at each update of the model's weight,
+    and n_steps must be saved for restarting.
+
+    Arguments
+    ---------
+    lr_initial : float
+        Initial learning rate (i.e. the lr used at epoch 0).
+    n_warmup_steps : int
+        numer of warm-up steps
+    n_hold_steps : int
+        number of hold steps.
+    n_decay_steps : int
+        number of decay steps
+    final_lr_scale : float
+        the proportion of final lr to initial lr
+
+    Example
+    -------
+    >>> from speechbrain.nnet.linear import Linear
+    >>> inp_tensor = torch.rand([1,660,3])
+    >>> model = Linear(input_size=3, n_neurons=4)
+    >>> optim = torch.optim.Adam(model.parameters(), lr=1)
+    >>> output = model(inp_tensor)
+    >>> scheduler =NoamScheduler(optim.param_groups[0]["lr"], 3)
+    >>> curr_lr,next_lr=scheduler(optim)
+    >>> optim.param_groups[0]["lr"]
+    0.33333333333333337
+    >>> curr_lr,next_lr=scheduler(optim)
+    >>> optim.param_groups[0]["lr"]
+    0.6666666666666667
+    >>> curr_lr,next_lr=scheduler(optim)
+    >>> optim.param_groups[0]["lr"]
+    1.0
+    """
+
+    def __init__(
+        self,
+        lr_initial,
+        n_warmup_steps,
+        n_hold_steps,
+        n_decay_steps,
+        final_lr_scale,
+    ):
+        self.lr_initial = lr_initial
+        self.n_warmup_steps = n_warmup_steps
+        self.n_hold_steps = n_hold_steps
+        self.n_decay_steps = n_decay_steps
+        self.final_lr_scale = final_lr_scale
+        self.current_lr = lr_initial
+        self.losses = []
+
+        self.n_steps = 0
+
+    def __call__(self, opt):
+        """
+        Arguments
+        ---------
+        opt : optimizer
+            The optimizer to update using this scheduler.
+
+        Returns
+        -------
+        current_lr : float
+            The learning rate before the update.
+        lr : float
+            The learning rate after the update.
+        """
+        self.n_steps += 1
+
+        current_lr = opt.param_groups[0]["lr"]
+
+        if self.n_steps <= self.n_warmup_steps:
+            lr = self.lr_initial * (self.n_steps / self.n_warmup_steps)
+        elif self.n_steps <= self.n_warmup_steps + self.n_hold_steps:
+            lr = self.lr_initial
+        elif (
+            self.n_steps
+            <= self.n_warmup_steps + self.n_hold_steps + self.n_decay_steps
+        ):
+            decay_steps = self.n_steps - self.n_warmup_steps - self.n_hold_steps
+            decay_factor = math.log(self.final_lr_scale) / self.n_decay_steps
+            lr = self.lr_initial * math.exp(decay_steps * decay_factor)
+        else:
+            lr = self.lr_initial * self.final_lr_scale
+
+        # Changing the learning rate within the optimizer
+        for param_group in opt.param_groups:
+            param_group["lr"] = lr
+
+        self.current_lr = lr
+        return current_lr, lr
+
+    @checkpoints.mark_as_saver
+    def save(self, path):
+        data = {"n_steps": self.n_steps}
+        torch.save(data, path)
+
+    @checkpoints.mark_as_loader
+    def load(self, path, end_of_epoch=False, device=None):
+        del end_of_epoch  # Unused in this class
+        del device
+        data = torch.load(path)
+        self.n_steps = data["n_steps"]
+
+
+@checkpoints.register_checkpoint_hooks
+class LinearWarmupScheduler:
+    """The is an implementation of the transformer's learning rate scheduler with warmup.
+    Reference: https://arxiv.org/abs/1706.03762
+
+    Note: this scheduler anneals the lr at each update of the model's weight,
+    and n_steps must be saved for restarting.
+
+    Arguments
+    ---------
+    lr_initial : float
+        Initial learning rate (i.e. the lr used at epoch 0).
+    n_warmup_steps : int
+        numer of warm-up steps
+
+    Example
+    -------
+    >>> from speechbrain.nnet.linear import Linear
+    >>> inp_tensor = torch.rand([1,660,3])
+    >>> model = Linear(input_size=3, n_neurons=4)
+    >>> optim = torch.optim.Adam(model.parameters(), lr=1)
+    >>> output = model(inp_tensor)
+    >>> scheduler =NoamScheduler(optim.param_groups[0]["lr"], 3)
+    >>> curr_lr,next_lr=scheduler(optim)
+    >>> optim.param_groups[0]["lr"]
+    0.33333333333333337
+    >>> curr_lr,next_lr=scheduler(optim)
+    >>> optim.param_groups[0]["lr"]
+    0.6666666666666667
+    >>> curr_lr,next_lr=scheduler(optim)
+    >>> optim.param_groups[0]["lr"]
+    1.0
+    """
+
+    def __init__(self, lr_initial, n_warmup_steps):
+        self.lr_initial = lr_initial
+        self.n_warmup_steps = n_warmup_steps
+        self.current_lr = lr_initial
+        self.losses = []
+
+        self.n_steps = 0
+
+    def __call__(self, opt):
+        """
+        Arguments
+        ---------
+        opt : optimizer
+            The optimizer to update using this scheduler.
+
+        Returns
+        -------
+        current_lr : float
+            The learning rate before the update.
+        lr : float
+            The learning rate after the update.
+        """
+        self.n_steps += 1
+
+        current_lr = opt.param_groups[0]["lr"]
+
+        if self.n_steps <= self.n_warmup_steps:
+            lr = self.lr_initial * (self.n_steps / self.n_warmup_steps)
+        else:
+            lr = self.lr_initial
+
+        # Changing the learning rate within the optimizer
+        for param_group in opt.param_groups:
+            param_group["lr"] = lr
+
+        self.current_lr = lr
+        return current_lr, lr
+
+    @checkpoints.mark_as_saver
+    def save(self, path):
+        data = {"n_steps": self.n_steps}
+        torch.save(data, path)
+
+    @checkpoints.mark_as_loader
+    def load(self, path, end_of_epoch=False, device=None):
+        del end_of_epoch  # Unused in this class
+        del device
+        data = torch.load(path)
+        self.n_steps = data["n_steps"]
+
+
+@checkpoints.register_checkpoint_hooks
 class NoamScheduler:
     """The is an implementation of the transformer's learning rate scheduler with warmup.
     Reference: https://arxiv.org/abs/1706.03762
