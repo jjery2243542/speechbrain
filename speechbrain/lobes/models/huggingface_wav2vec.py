@@ -21,7 +21,7 @@ except ImportError:
     print("Please install transformer from HuggingFace to use wav2vec2!")
 
 # For uniform initialization
-BOUND = 0.02
+BOUND = 0.01
 
 
 class HuggingFaceWav2Vec2MultiLayer(nn.Module):
@@ -73,7 +73,7 @@ class HuggingFaceWav2Vec2MultiLayer(nn.Module):
         apply_spec_augment=True,
         mask_time_prob=0.075,
         mask_time_length=10,
-        mask_feature_prob=0.2,
+        mask_feature_prob=0.5,
         mask_feature_length=64,
     ):
         super().__init__()
