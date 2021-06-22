@@ -1,0 +1,142 @@
+# ################################
+# Model: CTC ASR on TIMIT with CRDNN (with LiGRU)
+# Additions: TimeDomainSpecAugment
+# Authors: Mirco Ravanelli & Peter Plantinga 2020
+# ################################
+
+# Seed needs to be set at top of yaml, before objects with parameters are made
+seed: 1986
+__set_seed: !apply:torch.manual_seed [!ref <seed>]
+output_folder: !ref results/wav2vec-baseline/<seed>
+csv_folder: /share/data/speech/jjery2243542/data/LibriSpeech/frame_csv
+per_file: !ref <output_folder>/per.txt
+save_folder: !ref <output_folder>/save
+train_log: !ref <output_folder>/train_log.txt
+
+# Data files
+data_folder: !PLACEHOLDER  # e.g. /path/to/TIMIT
+train_splits: ["train-clean-100", "train-other-500"]
+dev_splits: ["dev-clean"]
+test_splits: ["test-clean", "test-other"]
+skip_prep: True # Skip data preparation
+sample_subsets: True # Skip data preparation
+wav2vec_hub: "facebook/wav2vec2-base"
+#wav2vec_hub: "https://dl.fbaipublicfiles.com/fairseq/wav2vec/libri960_big.pt"
+train_csv: !ref <csv_folder>/train-10m.csv
+valid_csv: !ref <csv_folder>/dev-10m.csv
+test_csv:
+    - !ref <csv_folder>/dev-clean.csv
+    - !ref <csv_folder>/dev-other.csv
+
+# Training parameters
+number_of_epochs: 700
+save_ckpt_every_n_epochs: 20
+batch_size: 8
+gradient_accumulation: 1
+lr: 0.0001
+final_lr_scale: 0.01
+n_warmup_steps: 0
+n_hold_steps: 4000
+n_decay_steps: 1000
+sorting: random # choose between ascending, descending and random
+
+# Feature parameters
+sample_rate: 16000
+hidden_size: 1024
+
+# Outputs
+output_neurons: 42 # 39 phn + 3 non-phn
+skip_tokens: ["sp", "spn", "sil"]
+
+# Model parameters
+return_nth_layer: -1
+re_init_from_nth_layer: null
+freeze: False
+freeze_until_nth_layer: null
+add_n_layers: 0
+apply_spec_augment: True
+mask_time_prob: 0.075
+mask_feature_prob: 0.5
+use_coef: False
+temperature: 1.0
+
+# Dataloader options
+train_dataloader_opts:
+    batch_size: !ref <batch_size>
+
+valid_dataloader_opts:
+    batch_size: !ref <batch_size>
+
+test_dataloader_opts:
+    batch_size: !ref <batch_size>
+
+#normalize: !new:speechbrain.processing.features.InputNormalization
+#    norm_type: global
+#
+#augmentation: !new:speechbrain.lobes.augment.TimeDomainSpecAugment
+#    sample_rate: !ref <sample_rate>
+#    speeds: [95, 100, 105]
+#
+## Can be removed to improve speed
+#env_corrupt: !new:speechbrain.lobes.augment.EnvCorrupt
+#    openrir_folder: !ref <open_rir_folder>
+#    babble_prob: 0.0
+#    reverb_prob: 0.0
+#    noise_prob: 1.0
+#    noise_snr_low: 0
+#    noise_snr_high: 15
+
+epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
+    limit: !ref <number_of_epochs>
+
+wav2vec: !new:speechbrain.lobes.models.huggingface_wav2vec.HuggingFaceWav2Vec2MultiLayer
+    source: !ref <wav2vec_hub>
+    freeze: !ref <freeze>
+    freeze_until_nth_layer: !ref <freeze_until_nth_layer>
+    apply_spec_augment: !ref <apply_spec_augment>
+    return_nth_layer: !ref <return_nth_layer>
+    re_init_from_nth_layer: !ref <re_init_from_nth_layer>
+    add_n_layers: !ref <add_n_layers>
+    use_coef: !ref <use_coef>
+    temperature: !ref <temperature>
+    save_path: !ref /share/data/speech/jjery2243542/wav2vec_checkpoint/huggingface/
+    mask_time_prob: !ref <mask_time_prob>
+    mask_feature_prob: !ref <mask_feature_prob>
+
+output: !new:speechbrain.nnet.linear.Linear
+    input_size: !ref <hidden_size>
+    n_neurons: !ref <output_neurons>
+    bias: True
+
+log_softmax: !new:speechbrain.nnet.activations.Softmax
+    apply_log: True
+
+opt_class: !name:torch.optim.Adam
+    lr: !ref <lr>
+
+lr_annealing: !new:speechbrain.nnet.schedulers.TriStageScheduler
+    lr_initial: !ref <lr>
+    n_warmup_steps: !ref <n_warmup_steps>
+    n_hold_steps: !ref <n_hold_steps>
+    n_decay_steps: !ref <n_decay_steps>
+    final_lr_scale: !ref <final_lr_scale>
+
+modules:
+    wav2vec: !ref <wav2vec>
+    output: !ref <output>
+
+checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
+    checkpoints_dir: !ref <save_folder>
+    recoverables:
+        wav2vec: !ref <wav2vec>
+        output: !ref <output>
+        scheduler: !ref <lr_annealing>
+        counter: !ref <epoch_counter>
+
+compute_cost: !name:speechbrain.nnet.losses.masked_nll_loss
+
+train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
+    save_file: !ref <train_log>
+
+acc_stats: !name:speechbrain.utils.Accuracy.MaskedAccuracyStats
+per_stats: !name:speechbrain.utils.metric_stats.ErrorRateStats

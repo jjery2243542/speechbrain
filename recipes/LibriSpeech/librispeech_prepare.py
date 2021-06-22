@@ -149,7 +149,7 @@ def prepare_librispeech(
                 save_folder,
                 "train-clean-100",
                 "train-other-500",
-                spk_info,
+                spk_path,
                 prefix="train",
             )
         if "dev-clean" in dev_splits and "dev-other" in dev_splits:
@@ -460,13 +460,20 @@ def sample_from_subset(
     save_folder,
     clean_split,
     noisy_split,
-    spk_info,
+    spk_path,
     sample_time=[600, 3600, 36000],
     prefix=None,
 ):
     clean_csv = os.path.join(save_folder, clean_split + ".csv")
     noisy_csv = os.path.join(save_folder, noisy_split + ".csv")
-
+    if prefix is None:
+        if "train" in clean_split:
+            prefix = "train"
+        elif "dev" in clean_split:
+            prefix = "dev"
+        elif "test" in clean_split:
+            prefix = "test"
+    spk_info = read_speaker_file(spk_path)
     # Roughly half female half male, and roughly half clean half noisy
     four_sets = {"clean_F": [], "clean_M": [], "noisy_F": [], "noisy_M": []}
     with open(clean_csv) as clean_csv_file:
@@ -502,12 +509,9 @@ def sample_from_subset(
             total_time += float(row["duration"])
             if total_time >= sample_time[csv_index]:
                 # Writing the csv_lines
-                if prefix is not None:
-                    csv_file = os.path.join(
-                        save_folder, f"{prefix}-{csv_names[csv_index]}"
-                    )
-                else:
-                    csv_file = os.path.join(save_folder, csv_names[csv_index])
+                csv_file = os.path.join(
+                    save_folder, f"{prefix}-{csv_names[csv_index]}"
+                )
                 with open(csv_file, mode="w") as csv_f:
                     csv_writer = csv.DictWriter(csv_f, fieldnames=fieldnames)
                     csv_writer.writeheader()
