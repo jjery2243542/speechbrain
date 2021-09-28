@@ -9,7 +9,6 @@ seed: 1986
 __set_seed: !apply:torch.manual_seed [!ref <seed>]
 output_folder: !ref results/wav2vec-baseline/<seed>
 csv_folder: /share/data/speech/jjery2243542/data/LibriSpeech/w2v_splits/frame_csv
-per_file: !ref <output_folder>/per.txt
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt
 
@@ -20,45 +19,47 @@ dev_splits: ["dev-clean"]
 test_splits: ["test-clean", "test-other"]
 skip_prep: True # Skip data preparation
 sample_subsets: True # Skip data preparation
-wav2vec_hub: "facebook/wav2vec2-base"
+wav2vec_hub: "facebook/wav2vec2-large-lv60"
 #wav2vec_hub: "https://dl.fbaipublicfiles.com/fairseq/wav2vec/libri960_big.pt"
-train_csv: !ref <csv_folder>/train-1h.csv
+train_csv: !ref <csv_folder>/train-10h.csv
 valid_csv: !ref <csv_folder>/dev-1h.csv
 test_csv:
     - !ref <csv_folder>/dev-clean.csv
     - !ref <csv_folder>/dev-other.csv
 
 # Training parameters
-number_of_epochs: 150
-save_ckpt_every_n_epochs: 5
+number_of_epochs: 1
+save_ckpt_every_n_epochs: 1
 batch_size: 8
-gradient_accumulation: 1
-lr: 0.0001
-final_lr_scale: 0.01
-n_warmup_steps: 0
-n_hold_steps: 4000
-n_decay_steps: 1000
 sorting: random # choose between ascending, descending and random
 
 # Feature parameters
 sample_rate: 16000
 hidden_size: 1024
+proj_size: 256
 
 # Outputs
-output_neurons: 42 # 39 phn + 3 non-phn
+n_phns: 42 # 39 phn + 3 non-phn
 skip_tokens: ["sp", "spn", "sil"]
 
-# Model parameters
-return_nth_layer: -1
+# W2V2 Model parameters
+return_nth_layers: [3, 6, 9, 12, 15, 18]
 re_init_from_nth_layer: null
-freeze: False
+freeze: True
 freeze_until_nth_layer: null
 add_n_layers: 0
-apply_spec_augment: True
-mask_time_prob: 0.075
-mask_feature_prob: 0.5
+w2v_apply_spec_augment: False
+w2v_mask_time_prob: 0.075
+w2v_mask_feature_prob: 0.5
 use_coef: False
 temperature: 1.0
+eval_mode: True
+
+# kmeans parameters
+n_clusters: 500
+kmeans_batch_size: 10000
+random_state: 0
+n_models: 6
 
 # Dataloader options
 train_dataloader_opts:
@@ -70,22 +71,6 @@ valid_dataloader_opts:
 test_dataloader_opts:
     batch_size: !ref <batch_size>
 
-#normalize: !new:speechbrain.processing.features.InputNormalization
-#    norm_type: global
-#
-#augmentation: !new:speechbrain.lobes.augment.TimeDomainSpecAugment
-#    sample_rate: !ref <sample_rate>
-#    speeds: [95, 100, 105]
-#
-## Can be removed to improve speed
-#env_corrupt: !new:speechbrain.lobes.augment.EnvCorrupt
-#    openrir_folder: !ref <open_rir_folder>
-#    babble_prob: 0.0
-#    reverb_prob: 0.0
-#    noise_prob: 1.0
-#    noise_snr_low: 0
-#    noise_snr_high: 15
-
 epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
     limit: !ref <number_of_epochs>
 
@@ -93,50 +78,43 @@ wav2vec: !new:speechbrain.lobes.models.huggingface_wav2vec.HuggingFaceWav2Vec2Mu
     source: !ref <wav2vec_hub>
     freeze: !ref <freeze>
     freeze_until_nth_layer: !ref <freeze_until_nth_layer>
-    apply_spec_augment: !ref <apply_spec_augment>
-    return_nth_layer: !ref <return_nth_layer>
+    apply_spec_augment: !ref <w2v_apply_spec_augment>
+    return_nth_layers: !ref <return_nth_layers>
     re_init_from_nth_layer: !ref <re_init_from_nth_layer>
     add_n_layers: !ref <add_n_layers>
     use_coef: !ref <use_coef>
     temperature: !ref <temperature>
     save_path: !ref /share/data/speech/jjery2243542/wav2vec_checkpoint/huggingface/
-    mask_time_prob: !ref <mask_time_prob>
-    mask_feature_prob: !ref <mask_feature_prob>
+    mask_time_prob: !ref <w2v_mask_time_prob>
+    mask_feature_prob: !ref <w2v_mask_feature_prob>
+    eval_mode: !ref <eval_mode>
 
-output: !new:speechbrain.nnet.linear.Linear
+kmeans_models: !new:speechbrain.lobes.models.cluster.KMeansModels
+    n_clusters: !ref <n_clusters>
+    batch_size: !ref <kmeans_batch_size>
+    random_state: !ref <random_state>
+    n_models: !ref <n_models>
+
+linear: !new:speechbrain.nnet.linear.Linear
     input_size: !ref <hidden_size>
-    n_neurons: !ref <output_neurons>
+    n_neurons: !ref <proj_size>
     bias: True
-
-log_softmax: !new:speechbrain.nnet.activations.Softmax
-    apply_log: True
-
-opt_class: !name:torch.optim.Adam
-    lr: !ref <lr>
-
-lr_annealing: !new:speechbrain.nnet.schedulers.TriStageScheduler
-    lr_initial: !ref <lr>
-    n_warmup_steps: !ref <n_warmup_steps>
-    n_hold_steps: !ref <n_hold_steps>
-    n_decay_steps: !ref <n_decay_steps>
-    final_lr_scale: !ref <final_lr_scale>
 
 modules:
     wav2vec: !ref <wav2vec>
-    output: !ref <output>
+    linear: !ref <linear>
 
 checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
     checkpoints_dir: !ref <save_folder>
     recoverables:
         wav2vec: !ref <wav2vec>
-        output: !ref <output>
-        scheduler: !ref <lr_annealing>
+        linear: !ref <linear>
         counter: !ref <epoch_counter>
-
-compute_cost: !name:speechbrain.nnet.losses.masked_nll_loss
+        kmeans_models: !ref <kmeans_models>
 
 train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
     save_file: !ref <train_log>
 
-acc_stats: !name:speechbrain.utils.Accuracy.MaskedAccuracyStats
-per_stats: !name:speechbrain.utils.metric_stats.ErrorRateStats
+confusion_stats: !name:speechbrain.utils.Confusion.ConfusionStats
+    n_clusters: !ref <n_clusters>
+    n_labels: !ref <n_phns>

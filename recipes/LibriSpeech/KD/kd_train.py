@@ -25,60 +25,66 @@ logger = logging.getLogger(__name__)
 
 
 # Define training procedure
-class ASR_Brain(sb.Brain):
+class KD_Brain(sb.Brain):
     def compute_forward(self, batch, stage):
         "Given an input batch it computes the phoneme probabilities."
         batch = batch.to(self.device)
         wavs, wav_lens = batch.sig
-        # Adding optional augmentation when specified:
-        if stage == sb.Stage.TRAIN:
-            if hasattr(self.hparams, "env_corrupt"):
-                wavs_noise = self.hparams.env_corrupt(wavs, wav_lens)
-                wavs = torch.cat([wavs, wavs_noise], dim=0)
-                wav_lens = torch.cat([wav_lens, wav_lens])
-            if hasattr(self.hparams, "augmentation"):
-                wavs = self.hparams.augmentation(wavs, wav_lens)
+        projections = []
 
-        if self.hparams.freeze:
-            with torch.no_grad():
-                feats = self.hparams.wav2vec(wavs)
-        else:
+        with torch.no_grad():
             feats = self.hparams.wav2vec(wavs)
+            feats = feats.split(self.hparams.hidden_size, dim=-1)
+            for feat in feats:
+                projections.append(self.hparams.projection(feat))
 
-        out = self.modules.output(feats)
-        pout = self.hparams.log_softmax(out)
-
-        return pout, wav_lens
+        out = self.modules.model(wavs)
+        output_lst, clusters_lst = [], []
+        for i in range(self.hparams.num_layers):
+            logits = self.modules.linears[i](out[i])
+            log_probs = self.hparams.log_softmax(logits / self.hparams.gamma)
+            if self.hparams.soft_dist:
+                clusters = self.hparams.kmeans_models[i].transform(
+                    projections[i], wav_lens, gamma=self.hparams.gamma,
+                )
+            else:
+                clusters = self.hparams.kmeans_models[i].predict(
+                    projections[i], wav_lens
+                )
+            output_lst.append(log_probs)
+            clusters_lst.append(clusters)
+        return output_lst, clusters_lst, wav_lens
 
     def compute_objectives(self, predictions, batch, stage):
         "Given the network predictions and targets computed the CTC loss."
-        pout, pout_lens = predictions
-        phns, phn_lens = batch.phn_encoded
+        log_probs, clusters, wav_lens = predictions
+        total_loss = 0.0
+        for i in range(self.hparams.num_layers):
+            if self.hparams.soft_dist:
+                loss = self.hparams.kl_cost(log_probs[i], clusters[i], wav_lens)
+            else:
+                loss = self.hparams.nll_cost(
+                    log_probs[i], clusters[i], wav_lens
+                )
 
-        if stage == sb.Stage.TRAIN and hasattr(self.hparams, "env_corrupt"):
-            phns = torch.cat([phns, phns], dim=0)
-            phn_lens = torch.cat([phn_lens, phn_lens], dim=0)
-
-        loss = self.hparams.compute_cost(
-            pout, phns, length=phn_lens, masked_indices=self.skip_token_indices,
-        )
-        self.acc_metrics.append(
-            log_probabilities=pout,
-            targets=phns,
-            length=phn_lens,
-            masked_indices=self.skip_token_indices,
-        )
-
-        if stage == sb.Stage.TEST:
-            sequence = sb.decoders.frame_greedy_decode(pout, pout_lens)
-            self.per_metrics.append(
+            total_loss += loss
+            self.loss_metrics[i].append(
                 ids=batch.id,
-                predict=sequence,
-                target=phns,
-                target_len=phn_lens,
-                ind2lab=self.label_encoder.decode_ndim,
+                log_probabilities=log_probs[i],
+                targets=clusters[i],
+                length=wav_lens,
             )
-        return loss
+            targets = (
+                clusters[i].max(dim=-1)[1]
+                if self.hparams.soft_dist
+                else clusters[i]
+            )
+            self.acc_metrics[i].append(
+                log_probabilities=log_probs[i],
+                targets=targets,
+                length=wav_lens,
+            )
+        return total_loss / self.hparams.num_layers
 
     def fit_batch(self, batch):
         outputs = self.compute_forward(batch, sb.Stage.TRAIN)
@@ -95,24 +101,67 @@ class ASR_Brain(sb.Brain):
 
     def on_stage_start(self, stage, epoch):
         "Gets called when a stage (either training, validation, test) starts."
-        self.acc_metrics = self.hparams.acc_stats()
-        if stage == sb.Stage.TEST:
-            self.per_metrics = self.hparams.per_stats()
+        self.acc_metrics = [
+            self.hparams.acc_stats() for _ in range(self.hparams.num_layers)
+        ]
+        if self.hparams.soft_dist:
+            self.loss_metrics = [
+                self.hparams.kl_loss_stats()
+                for _ in range(self.hparams.num_layers)
+            ]
+        else:
+            self.loss_metrics = [
+                self.hparams.nll_loss_stats()
+                for _ in range(self.hparams.num_layers)
+            ]
 
     def on_stage_end(self, stage, stage_loss, epoch):
         """Gets called at the end of a stage."""
         if stage == sb.Stage.TRAIN:
             self.train_loss = stage_loss
-            self.train_acc = self.acc_metrics.summarize()
+            self.train_loss_lst = {
+                f"loss_l{i}": self.loss_metrics[i].summarize("average")
+                for i in range(self.hparams.num_layers)
+            }
+            self.train_acc_lst = {
+                f"acc_l{i}": self.acc_metrics[i].summarize()
+                for i in range(self.hparams.num_layers)
+            }
+            self.train_acc = (
+                sum([val for key, val in self.train_acc_lst.items()])
+                / self.hparams.num_layers
+            )
+
         else:
-            stage_acc = self.acc_metrics.summarize()
+            self.stage_loss_lst = {
+                f"loss_l{i}": self.loss_metrics[i].summarize("average")
+                for i in range(self.hparams.num_layers)
+            }
+            self.stage_acc_lst = {
+                f"acc_l{i}": self.acc_metrics[i].summarize()
+                for i in range(self.hparams.num_layers)
+            }
+            self.stage_acc = (
+                sum([val for key, val in self.stage_acc_lst.items()])
+                / self.hparams.num_layers
+            )
 
         if stage == sb.Stage.VALID:
             lr = self.hparams.lr_annealing.current_lr
             self.hparams.train_logger.log_stats(
                 stats_meta={"epoch": epoch, "lr": lr},
-                train_stats={"loss": self.train_loss, "ACC": self.train_acc},
-                valid_stats={"loss": stage_loss, "ACC": stage_acc},
+                train_stats={
+                    "total_loss": self.train_loss,
+                    "total_acc": self.train_acc,
+                    **self.train_loss_lst,
+                    **self.train_acc_lst,
+                },
+                valid_stats={
+                    "total_loss": stage_loss,
+                    "total_acc": self.stage_acc,
+                    **self.stage_loss_lst,
+                    **self.stage_acc_lst,
+                },
             )
             if (
                 self.hparams.epoch_counter.current
@@ -120,19 +169,8 @@ class ASR_Brain(sb.Brain):
                 == 0
             ):
                 self.checkpointer.save_and_keep_only(
-                    meta={"ACC": stage_acc}, max_keys=["ACC"],
+                    meta={"ACC": self.stage_acc}, max_keys=["ACC"],
                 )
-
-        elif stage == sb.Stage.TEST:
-            per = self.per_metrics.summarize("error_rate")
-            self.hparams.train_logger.log_stats(
-                stats_meta={"Epoch loaded": self.hparams.epoch_counter.current},
-                test_stats={"loss": stage_loss, "PER": per, "ACC": stage_acc},
-            )
-            with open(self.hparams.per_file, "w") as w:
-                w.write("\nPER stats:\n")
-                self.per_metrics.write_stats(w)
-                print("PER stats written to ", self.hparams.per_file)
 
 
 def dataio_prep(hparams):
@@ -182,7 +220,7 @@ def dataio_prep(hparams):
         )
 
     datasets = [train_data, valid_data] + [i for k, i in test_datasets.items()]
-    label_encoder = sb.dataio.encoder.TextEncoder()
+    label_encoder = sb.dataio.encoder.CTCTextEncoder()
 
     # 2. Define audio pipeline:
     @sb.utils.data_pipeline.takes("wav")
@@ -194,33 +232,31 @@ def dataio_prep(hparams):
     sb.dataio.dataset.add_dynamic_item(datasets, audio_pipeline)
 
     # 3. Define text pipeline:
-    @sb.utils.data_pipeline.takes("phn")
-    @sb.utils.data_pipeline.provides("phn_list", "phn_encoded")
-    def text_pipeline(phn):
-        phn_list = phn.strip().split()
-        yield phn_list
-        phn_encoded = label_encoder.encode_sequence_torch(phn_list)
-        yield phn_encoded
+    @sb.utils.data_pipeline.takes("char")
+    @sb.utils.data_pipeline.provides("char_list", "char_encoded")
+    def text_pipeline(char):
+        char_list = char.strip().split()
+        yield char_list
+        char_encoded = label_encoder.encode_sequence_torch(char_list)
+        yield char_encoded
 
     sb.dataio.dataset.add_dynamic_item(datasets, text_pipeline)
 
     # 3. Fit encoder:
     # Load or compute the label encoder (with multi-gpu dpp support)
-    label_encoder.update_from_didataset(train_data, output_key="phn_list")
-    skip_token_indices = [
-        label_encoder.encode_label(token) for token in hparams["skip_tokens"]
-    ]
+    lab_enc_file = os.path.join(hparams["csv_folder"], "label_encoder.txt")
+    label_encoder.load_or_create(
+        path=lab_enc_file,
+        from_didatasets=[train_data],
+        output_key="char_list",
+        special_labels={"blank_label": hparams["blank_index"]},
+        sequence_input=True,
+    )
 
     # 4. Set output:
-    sb.dataio.dataset.set_output_keys(datasets, ["id", "sig", "phn_encoded"])
+    sb.dataio.dataset.set_output_keys(datasets, ["id", "sig", "char_encoded"])
 
-    return (
-        train_data,
-        valid_data,
-        test_datasets,
-        label_encoder,
-        skip_token_indices,
-    )
+    return train_data, valid_data, test_datasets, label_encoder
 
 
 # Begin Recipe!
@@ -261,29 +297,37 @@ if __name__ == "__main__":
     )
 
     # Dataset IO prep: creating Dataset objects and proper encodings for phones
-    (
-        train_data,
-        valid_data,
-        test_datasets,
-        label_encoder,
-        skip_token_indices,
-    ) = dataio_prep(hparams)
+    train_data, valid_data, test_datasets, label_encoder = dataio_prep(hparams)
+
+    run_on_main(hparams["pretrainer"].collect_files)
+    hparams["pretrainer"].load_collected(device=run_opts["device"])
+
+    linears = torch.nn.ModuleList(
+        [hparams["linear"]() for _ in range(hparams["num_layers"])]
+    )
+    hparams["modules"]["linears"] = linears
+    hparams["checkpointer"].add_recoverable("linears", linears)
+
+    # convs = torch.nn.ModuleList([hparams["conv"]() for _ in range(hparams["num_layers"])])
+    # hparams["modules"]["convs"] = convs
+    # hparams["checkpointer"].add_recoverable("convs", convs)
+
+    # Fix the projection linear layer
+    for params in hparams["projection"].parameters():
+        params.requires_grad = False
 
     # Trainer initialization
-    asr_brain = ASR_Brain(
+    kd_brain = KD_Brain(
         modules=hparams["modules"],
         opt_class=hparams["opt_class"],
         hparams=hparams,
         run_opts=run_opts,
         checkpointer=hparams["checkpointer"],
     )
-
-    asr_brain.label_encoder = label_encoder
-    asr_brain.skip_token_indices = skip_token_indices
-
+    kd_brain.label_encoder = label_encoder
     # Training/validation loop
-    asr_brain.fit(
-        asr_brain.hparams.epoch_counter,
+    kd_brain.fit(
+        kd_brain.hparams.epoch_counter,
         train_data,
         valid_data,
         train_loader_kwargs=hparams["train_dataloader_opts"],
@@ -292,11 +336,8 @@ if __name__ == "__main__":
 
     # Testing
     for k in test_datasets.keys():  # keys are test_clean, test_other etc
-        asr_brain.hparams.per_file = os.path.join(
-            hparams["output_folder"], "per_{}.txt".format(k)
-        )
-        asr_brain.evaluate(
+        kd_brain.evaluate(
             test_datasets[k],
-            max_key="acc",
+            max_key="ACC",
             test_loader_kwargs=hparams["test_dataloader_opts"],
         )

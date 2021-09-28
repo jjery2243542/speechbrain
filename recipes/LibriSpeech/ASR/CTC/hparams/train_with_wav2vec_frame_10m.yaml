@@ -8,7 +8,7 @@
 seed: 1986
 __set_seed: !apply:torch.manual_seed [!ref <seed>]
 output_folder: !ref results/wav2vec-baseline/<seed>
-csv_folder: /share/data/speech/jjery2243542/data/LibriSpeech/frame_csv
+csv_folder: /share/data/speech/jjery2243542/data/LibriSpeech/w2v_splits/frame_csv
 per_file: !ref <output_folder>/per.txt
 save_folder: !ref <output_folder>/save
 train_log: !ref <output_folder>/train_log.txt
@@ -22,7 +22,7 @@ skip_prep: True # Skip data preparation
 sample_subsets: True # Skip data preparation
 wav2vec_hub: "facebook/wav2vec2-base"
 #wav2vec_hub: "https://dl.fbaipublicfiles.com/fairseq/wav2vec/libri960_big.pt"
-train_csv: !ref <csv_folder>/train-10m.csv
+train_csv: !ref <csv_folder>/train-10m-0.csv
 valid_csv: !ref <csv_folder>/dev-10m.csv
 test_csv:
     - !ref <csv_folder>/dev-clean.csv

@@ -753,7 +753,6 @@ def compute_masked_loss(
             length_mask = length_mask.unsqueeze(-1)
         length_mask = length_mask.type(mask.dtype)
         mask *= length_mask
-
     # Compute, then reduce loss
     loss = loss_fn(predictions, targets) * mask
     N = loss.size(0)
@@ -1164,6 +1163,59 @@ def ce_kd(inp, target):
         The probabilities from teacher model, of shape [batch_size * length, feature]
     """
     return (-target * inp).sum(1)
+
+
+def kl_loss(
+    log_probabilities,
+    targets,
+    length=None,
+    label_smoothing=0.0,
+    allowed_len_diff=3,
+    reduction="mean",
+):
+    """Computes negative log likelihood loss.
+
+    Arguments
+    ---------
+    log_probabilities : torch.Tensor
+        The probabilities after log has been applied.
+        Format is [batch, log_p] or [batch, frames, log_p].
+    targets : torch.Tensor
+        The targets, of shape [batch] or [batch, frames].
+    length : torch.Tensor
+        Length of each utterance, if frame-level loss is desired.
+    allowed_len_diff : int
+        Length difference that will be tolerated before raising an exception.
+    reduction : str
+        Options are 'mean', 'batch', 'batchmean', 'sum'.
+        See pytorch for 'mean', 'sum'. The 'batch' option returns
+        one loss per item in the batch, 'batchmean' returns sum / batch size.
+
+    Example
+    -------
+    >>> probs = torch.tensor([[0.9, 0.1], [0.1, 0.9]])
+    >>> nll_loss(torch.log(probs), torch.tensor([1, 1]))
+    tensor(1.2040)
+    """
+    if len(log_probabilities.shape) == 3:
+        log_probabilities, targets = truncate(
+            log_probabilities, targets, allowed_len_diff
+        )
+
+    # Pass the loss function but apply reduction="none" first
+    loss = functools.partial(torch.nn.functional.kl_div, reduction="none")
+
+    def compose(x, y):
+        return loss(x, y) * x.shape[-1]
+
+    return compute_masked_loss(
+        compose,
+        log_probabilities,
+        targets,
+        length,
+        label_smoothing=label_smoothing,
+        reduction=reduction,
+    )
 
 
 def nll_loss_kd(

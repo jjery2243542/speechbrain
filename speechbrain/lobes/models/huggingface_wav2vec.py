@@ -103,7 +103,7 @@ class HuggingFaceWav2Vec2MultiLayer(nn.Module):
         freeze=True,
         freeze_until_nth_layer=None,
         re_init_from_nth_layer=None,
-        return_nth_layer=-1,
+        return_nth_layers=[-1],
         use_coef=False,
         temperature=1.0,
         apply_spec_augment=True,
@@ -111,6 +111,7 @@ class HuggingFaceWav2Vec2MultiLayer(nn.Module):
         mask_time_length=10,
         mask_feature_prob=0.5,
         mask_feature_length=64,
+        eval_mode=False,
     ):
         super().__init__()
 
@@ -137,9 +138,9 @@ class HuggingFaceWav2Vec2MultiLayer(nn.Module):
         self.model.config.mask_feature_prob = mask_feature_prob
         self.model.config.mask_feature_length = mask_feature_length
         self.model.config.layerdrop = 0.0
-        self.model.config.attention_dropout = 0.0
-        self.model.config.feat_project_dropout = 0.0
-        self.model.config.hidden_dropout = 0.0
+        # self.model.config.attention_dropout = 0.0
+        # self.model.config.feat_project_dropout = 0.0
+        # self.model.config.hidden_dropout = 0.0
 
         # Make the model return multiple layers
         self.model.config.output_hidden_states = True
@@ -156,17 +157,17 @@ class HuggingFaceWav2Vec2MultiLayer(nn.Module):
             nn.init.uniform_(self.coef_param, -BOUND, BOUND)
             self.softmax = nn.Softmax(dim=0)
 
-        if self.use_coef and return_nth_layer != -1:
+        if self.use_coef and return_nth_layers[0] != -1:
             raise ValueError(
                 "When using coefficient, the model will return the mixture of multiple layers."
             )
 
-        self.return_nth_layer = (
-            return_nth_layer + self.num_hidden_states + self.add_n_layers
-            if return_nth_layer < 0
-            else return_nth_layer
-        )
-
+        self.return_nth_layers = [
+            layer + self.num_hidden_states + self.add_n_layers
+            if layer < 0
+            else layer
+            for layer in return_nth_layers
+        ]
         if self.add_n_layers > 0:
             if not self.use_coef:
                 extra_layers = [
@@ -206,6 +207,8 @@ class HuggingFaceWav2Vec2MultiLayer(nn.Module):
                 self.freeze_layers(self.model, self.num_hidden_layers)
             else:
                 self.freeze_layers(self.model, self.freeze_until_nth_layer)
+        if eval_mode:
+            self.model.eval()
 
     def forward(self, wav):
         """Takes an input waveform and return its corresponding wav2vec encoding.
@@ -233,7 +236,9 @@ class HuggingFaceWav2Vec2MultiLayer(nn.Module):
         # Extract wav2vec output for each layers
         out = self.model(wav)[1]
         if not self.use_coef:
-            return out[self.return_nth_layer]
+            hiddens = [out[layer] for layer in self.return_nth_layers]
+            hiddens = torch.cat(hiddens, dim=-1)
+            return hiddens
         else:
             out = torch.stack(out, dim=2)
             coef = self.softmax(self.coef_param / self.temperature).view(

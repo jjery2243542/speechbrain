@@ -14,7 +14,7 @@ Authors
 
 import os
 import sys
-import torch
+import math
 import logging
 import speechbrain as sb
 from pathlib import Path
@@ -31,21 +31,9 @@ class ASR_Brain(sb.Brain):
         batch = batch.to(self.device)
         wavs, wav_lens = batch.sig
         # Adding optional augmentation when specified:
-        if stage == sb.Stage.TRAIN:
-            if hasattr(self.hparams, "env_corrupt"):
-                wavs_noise = self.hparams.env_corrupt(wavs, wav_lens)
-                wavs = torch.cat([wavs, wavs_noise], dim=0)
-                wav_lens = torch.cat([wav_lens, wav_lens])
-            if hasattr(self.hparams, "augmentation"):
-                wavs = self.hparams.augmentation(wavs, wav_lens)
-
-        if self.hparams.freeze:
-            with torch.no_grad():
-                feats = self.hparams.wav2vec(wavs)
-        else:
-            feats = self.hparams.wav2vec(wavs)
-
-        out = self.modules.output(feats)
+        # Only use the last layer output
+        out = self.hparams.model(wavs)[-1]
+        out = self.modules.linear(out)
         pout = self.hparams.log_softmax(out)
 
         return pout, wav_lens
@@ -53,29 +41,28 @@ class ASR_Brain(sb.Brain):
     def compute_objectives(self, predictions, batch, stage):
         "Given the network predictions and targets computed the CTC loss."
         pout, pout_lens = predictions
-        phns, phn_lens = batch.phn_encoded
+        chars, char_lens = batch.char_encoded
 
-        if stage == sb.Stage.TRAIN and hasattr(self.hparams, "env_corrupt"):
-            phns = torch.cat([phns, phns], dim=0)
-            phn_lens = torch.cat([phn_lens, phn_lens], dim=0)
+        loss = self.hparams.compute_cost(pout, chars, pout_lens, char_lens)
+        self.ctc_metrics.append(batch.id, pout, chars, pout_lens, char_lens)
 
-        loss = self.hparams.compute_cost(
-            pout, phns, length=phn_lens, masked_indices=self.skip_token_indices,
-        )
-        self.acc_metrics.append(
-            log_probabilities=pout,
-            targets=phns,
-            length=phn_lens,
-            masked_indices=self.skip_token_indices,
-        )
-
-        if stage == sb.Stage.TEST:
-            sequence = sb.decoders.frame_greedy_decode(pout, pout_lens)
-            self.per_metrics.append(
+        if stage != sb.Stage.TRAIN:
+            sequence = sb.decoders.ctc_greedy_decode(
+                pout, pout_lens, blank_id=self.hparams.blank_index
+            )
+            self.cer_metrics.append(
                 ids=batch.id,
                 predict=sequence,
-                target=phns,
-                target_len=phn_lens,
+                target=chars,
+                target_len=char_lens,
+                ind2lab=self.label_encoder.decode_ndim,
+            )
+
+            self.wer_metrics.append(
+                ids=batch.id,
+                predict=sequence,
+                target=chars,
+                target_len=char_lens,
                 ind2lab=self.label_encoder.decode_ndim,
             )
         return loss
@@ -95,24 +82,25 @@ class ASR_Brain(sb.Brain):
 
     def on_stage_start(self, stage, epoch):
         "Gets called when a stage (either training, validation, test) starts."
-        self.acc_metrics = self.hparams.acc_stats()
-        if stage == sb.Stage.TEST:
-            self.per_metrics = self.hparams.per_stats()
+        self.ctc_metrics = self.hparams.ctc_stats()
+        if stage != sb.Stage.TRAIN:
+            self.cer_metrics = self.hparams.cer_stats()
+            self.wer_metrics = self.hparams.wer_stats(merge_tokens=True)
 
     def on_stage_end(self, stage, stage_loss, epoch):
         """Gets called at the end of a stage."""
         if stage == sb.Stage.TRAIN:
             self.train_loss = stage_loss
-            self.train_acc = self.acc_metrics.summarize()
         else:
-            stage_acc = self.acc_metrics.summarize()
+            cer = self.cer_metrics.summarize("error_rate")
+            wer = self.wer_metrics.summarize("error_rate")
 
         if stage == sb.Stage.VALID:
             lr = self.hparams.lr_annealing.current_lr
             self.hparams.train_logger.log_stats(
                 stats_meta={"epoch": epoch, "lr": lr},
-                train_stats={"loss": self.train_loss, "ACC": self.train_acc},
-                valid_stats={"loss": stage_loss, "ACC": stage_acc},
+                train_stats={"loss": self.train_loss},
+                valid_stats={"loss": stage_loss, "CER": cer, "WER": wer},
             )
             if (
                 self.hparams.epoch_counter.current
@@ -120,19 +108,20 @@ class ASR_Brain(sb.Brain):
                 == 0
             ):
                 self.checkpointer.save_and_keep_only(
-                    meta={"ACC": stage_acc}, max_keys=["ACC"],
+                    meta={"CER": cer}, min_keys=["CER"],
                 )
 
         elif stage == sb.Stage.TEST:
-            per = self.per_metrics.summarize("error_rate")
             self.hparams.train_logger.log_stats(
                 stats_meta={"Epoch loaded": self.hparams.epoch_counter.current},
-                test_stats={"loss": stage_loss, "PER": per, "ACC": stage_acc},
+                test_stats={"loss": stage_loss, "CER": cer, "WER": wer},
             )
-            with open(self.hparams.per_file, "w") as w:
-                w.write("\nPER stats:\n")
-                self.per_metrics.write_stats(w)
-                print("PER stats written to ", self.hparams.per_file)
+            with open(self.hparams.wer_file, "w") as w:
+                w.write("CTC loss stats:\n")
+                self.ctc_metrics.write_stats(w)
+                w.write("\nWER stats:\n")
+                self.wer_metrics.write_stats(w)
+                print("CTC and WER stats written to ", self.hparams.wer_file)
 
 
 def dataio_prep(hparams):
@@ -182,7 +171,7 @@ def dataio_prep(hparams):
         )
 
     datasets = [train_data, valid_data] + [i for k, i in test_datasets.items()]
-    label_encoder = sb.dataio.encoder.TextEncoder()
+    label_encoder = sb.dataio.encoder.CTCTextEncoder()
 
     # 2. Define audio pipeline:
     @sb.utils.data_pipeline.takes("wav")
@@ -194,33 +183,31 @@ def dataio_prep(hparams):
     sb.dataio.dataset.add_dynamic_item(datasets, audio_pipeline)
 
     # 3. Define text pipeline:
-    @sb.utils.data_pipeline.takes("phn")
-    @sb.utils.data_pipeline.provides("phn_list", "phn_encoded")
-    def text_pipeline(phn):
-        phn_list = phn.strip().split()
-        yield phn_list
-        phn_encoded = label_encoder.encode_sequence_torch(phn_list)
-        yield phn_encoded
+    @sb.utils.data_pipeline.takes("char")
+    @sb.utils.data_pipeline.provides("char_list", "char_encoded")
+    def text_pipeline(char):
+        char_list = char.strip().split()
+        yield char_list
+        char_encoded = label_encoder.encode_sequence_torch(char_list)
+        yield char_encoded
 
     sb.dataio.dataset.add_dynamic_item(datasets, text_pipeline)
 
     # 3. Fit encoder:
     # Load or compute the label encoder (with multi-gpu dpp support)
-    label_encoder.update_from_didataset(train_data, output_key="phn_list")
-    skip_token_indices = [
-        label_encoder.encode_label(token) for token in hparams["skip_tokens"]
-    ]
+    lab_enc_file = os.path.join(hparams["csv_folder"], "label_encoder.txt")
+    label_encoder.load_or_create(
+        path=lab_enc_file,
+        from_didatasets=[train_data],
+        output_key="char_list",
+        special_labels={"blank_label": hparams["blank_index"]},
+        sequence_input=True,
+    )
 
     # 4. Set output:
-    sb.dataio.dataset.set_output_keys(datasets, ["id", "sig", "phn_encoded"])
+    sb.dataio.dataset.set_output_keys(datasets, ["id", "sig", "char_encoded"])
 
-    return (
-        train_data,
-        valid_data,
-        test_datasets,
-        label_encoder,
-        skip_token_indices,
-    )
+    return train_data, valid_data, test_datasets, label_encoder
 
 
 # Begin Recipe!
@@ -237,7 +224,7 @@ if __name__ == "__main__":
     from librispeech_prepare import prepare_librispeech  # noqa
 
     # Initialize ddp (useful only for multi-GPU DDP training)
-    sb.utils.distributed.ddp_init_group(run_opts)
+    # sb.utils.distributed.ddp_init_group(run_opts)
 
     # Create experiment directory
     sb.create_experiment_directory(
@@ -259,15 +246,13 @@ if __name__ == "__main__":
             "sample_subsets": hparams["sample_subsets"],
         },
     )
+    if hparams["load_pretrain"]:
+        run_on_main(hparams["pretrainer"].collect_files)
+        hparams["pretrainer"].load_collected(device=run_opts["device"])
 
     # Dataset IO prep: creating Dataset objects and proper encodings for phones
-    (
-        train_data,
-        valid_data,
-        test_datasets,
-        label_encoder,
-        skip_token_indices,
-    ) = dataio_prep(hparams)
+    train_data, valid_data, test_datasets, label_encoder = dataio_prep(hparams)
+    hparams["n_batches"] = math.ceil(len(train_data) / hparams["batch_size"])
 
     # Trainer initialization
     asr_brain = ASR_Brain(
@@ -277,10 +262,7 @@ if __name__ == "__main__":
         run_opts=run_opts,
         checkpointer=hparams["checkpointer"],
     )
-
     asr_brain.label_encoder = label_encoder
-    asr_brain.skip_token_indices = skip_token_indices
-
     # Training/validation loop
     asr_brain.fit(
         asr_brain.hparams.epoch_counter,
@@ -292,11 +274,11 @@ if __name__ == "__main__":
 
     # Testing
     for k in test_datasets.keys():  # keys are test_clean, test_other etc
-        asr_brain.hparams.per_file = os.path.join(
-            hparams["output_folder"], "per_{}.txt".format(k)
+        asr_brain.hparams.wer_file = os.path.join(
+            hparams["output_folder"], "wer_{}.txt".format(k)
         )
         asr_brain.evaluate(
             test_datasets[k],
-            max_key="acc",
+            min_key="CER",
             test_loader_kwargs=hparams["test_dataloader_opts"],
         )

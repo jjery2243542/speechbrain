@@ -25,94 +25,77 @@ logger = logging.getLogger(__name__)
 
 
 # Define training procedure
-class ASR_Brain(sb.Brain):
+class KM_Brain(sb.Brain):
     def compute_forward(self, batch, stage):
         "Given an input batch it computes the phoneme probabilities."
         batch = batch.to(self.device)
         wavs, wav_lens = batch.sig
-        # Adding optional augmentation when specified:
-        if stage == sb.Stage.TRAIN:
-            if hasattr(self.hparams, "env_corrupt"):
-                wavs_noise = self.hparams.env_corrupt(wavs, wav_lens)
-                wavs = torch.cat([wavs, wavs_noise], dim=0)
-                wav_lens = torch.cat([wav_lens, wav_lens])
-            if hasattr(self.hparams, "augmentation"):
-                wavs = self.hparams.augmentation(wavs, wav_lens)
-
-        if self.hparams.freeze:
-            with torch.no_grad():
-                feats = self.hparams.wav2vec(wavs)
-        else:
-            feats = self.hparams.wav2vec(wavs)
-
-        out = self.modules.output(feats)
-        pout = self.hparams.log_softmax(out)
-
-        return pout, wav_lens
-
-    def compute_objectives(self, predictions, batch, stage):
-        "Given the network predictions and targets computed the CTC loss."
-        pout, pout_lens = predictions
         phns, phn_lens = batch.phn_encoded
 
-        if stage == sb.Stage.TRAIN and hasattr(self.hparams, "env_corrupt"):
-            phns = torch.cat([phns, phns], dim=0)
-            phn_lens = torch.cat([phn_lens, phn_lens], dim=0)
+        # To prevent length difference
+        lens = phn_lens if stage == sb.Stage.TEST else wav_lens
+        with torch.no_grad():
+            feats = self.hparams.wav2vec(wavs)
+            feats = feats.split(self.hparams.hidden_size, dim=-1)
+        projections = []
+        for i, model in enumerate(self.hparams.kmeans_models):
+            projection = self.hparams.linear(feats[i])
+            projections.append(projection)
 
-        loss = self.hparams.compute_cost(
-            pout, phns, length=phn_lens, masked_indices=self.skip_token_indices,
-        )
-        self.acc_metrics.append(
-            log_probabilities=pout,
-            targets=phns,
-            length=phn_lens,
-            masked_indices=self.skip_token_indices,
-        )
+            if stage == sb.Stage.TRAIN:
+                model(projection, lens)
 
+        return projections, lens
+
+    def compute_objectives(self, predictions, batch, stage):
+        projections, lens = predictions
+        score = 0
+        for i, model in enumerate(self.hparams.kmeans_models):
+            score += model.score(projections[i], lens)
+        score = score / len(self.hparams.kmeans_models)
         if stage == sb.Stage.TEST:
-            sequence = sb.decoders.frame_greedy_decode(pout, pout_lens)
-            self.per_metrics.append(
-                ids=batch.id,
-                predict=sequence,
-                target=phns,
-                target_len=phn_lens,
-                ind2lab=self.label_encoder.decode_ndim,
-            )
-        return loss
+            batch = batch.to(self.device)
+            phns, phn_lens = batch.phn_encoded
+            for i in range(len(self.hparams.kmeans_models)):
+                clusters = self.hparams.kmeans_models[i].predict(
+                    projections[i], lens
+                )
+                self.confusion_metrics[i].append(
+                    clusters=clusters,
+                    targets=phns,
+                    length=lens,
+                    masked_indices=self.skip_token_indices,
+                )
+        return score
 
     def fit_batch(self, batch):
         outputs = self.compute_forward(batch, sb.Stage.TRAIN)
-        loss = self.compute_objectives(outputs, batch, sb.Stage.TRAIN)
-        (loss / self.hparams.gradient_accumulation).backward()
+        score = self.compute_objectives(outputs, batch, sb.Stage.TRAIN)
+        return score
 
-        if self.step % self.hparams.gradient_accumulation == 0:
-            # gradient clipping & early stop if loss is not finite
-            self.check_gradients(loss)
-            self.hparams.lr_annealing(self.optimizer)
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-        return loss.detach().cpu()
+    def evaluate_batch(self, batch, stage):
+        outputs = self.compute_forward(batch, stage)
+        score = self.compute_objectives(outputs, batch, stage)
+        return score
 
     def on_stage_start(self, stage, epoch):
         "Gets called when a stage (either training, validation, test) starts."
-        self.acc_metrics = self.hparams.acc_stats()
         if stage == sb.Stage.TEST:
-            self.per_metrics = self.hparams.per_stats()
+            self.confusion_metrics = [
+                self.hparams.confusion_stats()
+                for _ in range(len(self.hparams.return_nth_layers))
+            ]
 
     def on_stage_end(self, stage, stage_loss, epoch):
         """Gets called at the end of a stage."""
         if stage == sb.Stage.TRAIN:
-            self.train_loss = stage_loss
-            self.train_acc = self.acc_metrics.summarize()
-        else:
-            stage_acc = self.acc_metrics.summarize()
+            self.train_score = stage_loss
 
         if stage == sb.Stage.VALID:
-            lr = self.hparams.lr_annealing.current_lr
             self.hparams.train_logger.log_stats(
-                stats_meta={"epoch": epoch, "lr": lr},
-                train_stats={"loss": self.train_loss, "ACC": self.train_acc},
-                valid_stats={"loss": stage_loss, "ACC": stage_acc},
+                stats_meta={"epoch": epoch},
+                train_stats={"score": self.train_score},
+                valid_stats={"score": stage_loss},
             )
             if (
                 self.hparams.epoch_counter.current
@@ -120,19 +103,27 @@ class ASR_Brain(sb.Brain):
                 == 0
             ):
                 self.checkpointer.save_and_keep_only(
-                    meta={"ACC": stage_acc}, max_keys=["ACC"],
+                    meta={"score": stage_loss}, max_keys=["score"],
                 )
-
-        elif stage == sb.Stage.TEST:
-            per = self.per_metrics.summarize("error_rate")
-            self.hparams.train_logger.log_stats(
-                stats_meta={"Epoch loaded": self.hparams.epoch_counter.current},
-                test_stats={"loss": stage_loss, "PER": per, "ACC": stage_acc},
-            )
-            with open(self.hparams.per_file, "w") as w:
-                w.write("\nPER stats:\n")
-                self.per_metrics.write_stats(w)
-                print("PER stats written to ", self.hparams.per_file)
+        if stage == sb.Stage.TEST:
+            for i in range(len(self.hparams.kmeans_models)):
+                clu_pur, phn_pur = self.confusion_metrics[i].summarize()
+                layer_id = self.hparams.return_nth_layers[i]
+                self.hparams.train_logger.log_stats(
+                    stats_meta={
+                        "Epoch loaded": self.hparams.epoch_counter.current,
+                        "Layer": layer_id,
+                    },
+                    test_stats={
+                        "score": stage_loss,
+                        "cluster_purity": clu_pur,
+                        "phone_purity": phn_pur,
+                    },
+                )
+                confusion_file = os.path.join(
+                    self.hparams.save_folder, f"confusion_table_{layer_id}.pkl"
+                )
+                self.confusion_metrics[i].save_confusion(confusion_file)
 
 
 def dataio_prep(hparams):
@@ -270,20 +261,22 @@ if __name__ == "__main__":
     ) = dataio_prep(hparams)
 
     # Trainer initialization
-    asr_brain = ASR_Brain(
+    km_brain = KM_Brain(
         modules=hparams["modules"],
-        opt_class=hparams["opt_class"],
         hparams=hparams,
         run_opts=run_opts,
         checkpointer=hparams["checkpointer"],
     )
 
-    asr_brain.label_encoder = label_encoder
-    asr_brain.skip_token_indices = skip_token_indices
+    km_brain.label_encoder = label_encoder
+    km_brain.skip_token_indices = skip_token_indices
+
+    lab_enc_path = os.path.join(hparams["save_folder"], "label_encoder.txt")
+    label_encoder.save(lab_enc_path)
 
     # Training/validation loop
-    asr_brain.fit(
-        asr_brain.hparams.epoch_counter,
+    km_brain.fit(
+        km_brain.hparams.epoch_counter,
         train_data,
         valid_data,
         train_loader_kwargs=hparams["train_dataloader_opts"],
@@ -292,11 +285,8 @@ if __name__ == "__main__":
 
     # Testing
     for k in test_datasets.keys():  # keys are test_clean, test_other etc
-        asr_brain.hparams.per_file = os.path.join(
-            hparams["output_folder"], "per_{}.txt".format(k)
-        )
-        asr_brain.evaluate(
+        km_brain.evaluate(
             test_datasets[k],
-            max_key="acc",
+            max_key="score",
             test_loader_kwargs=hparams["test_dataloader_opts"],
         )

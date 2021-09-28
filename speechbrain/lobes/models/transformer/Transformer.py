@@ -719,3 +719,116 @@ def get_lookahead_mask(padded_input):
         .masked_fill(mask == 1, float(0.0))
     )
     return mask.detach().to(padded_input.device)
+
+
+class TransformerEncoderPerLayer(nn.Module):
+    """This class implements the transformer encoder.
+
+    Arguments
+    ---------
+    num_layers : int
+        Number of transformer layers to include.
+    nhead : int
+        Number of attention heads.
+    d_ffn : int
+        Hidden size of self-attention Feed Forward layer.
+    input_shape : tuple
+        Expected shape of an example input.
+    d_model : int
+        The dimension of the input embedding.
+    kdim : int
+        Dimension for key (Optional).
+    vdim : int
+        Dimension for value (Optional).
+    dropout : float
+        Dropout for the encoder (Optional).
+    input_module: torch class
+        The module to process the source input feature to expected
+        feature dimension (Optional).
+
+    Example
+    -------
+    >>> import torch
+    >>> x = torch.rand((8, 60, 512))
+    >>> net = TransformerEncoder(1, 8, 512, d_model=512)
+    >>> output, _ = net(x)
+    >>> output.shape
+    torch.Size([8, 60, 512])
+    """
+
+    def __init__(
+        self,
+        num_layers,
+        nhead,
+        d_ffn,
+        input_shape=None,
+        d_model=None,
+        kdim=None,
+        vdim=None,
+        dropout=0.1,
+        activation=nn.ReLU,
+        normalize_before=False,
+    ):
+        super().__init__()
+
+        if input_shape is None and d_model is None:
+            raise ValueError("Expected one of input_shape or d_model")
+
+        if input_shape is not None and d_model is None:
+            if len(input_shape) == 3:
+                msg = "Input shape of the Transformer must be (batch, time, fea). Please revise the forward function in TransformerInterface to handel arbitary shape of input."
+                raise ValueError(msg)
+            d_model = input_shape[-1]
+
+        self.layers = torch.nn.ModuleList(
+            [
+                TransformerEncoderLayer(
+                    d_ffn=d_ffn,
+                    nhead=nhead,
+                    d_model=d_model,
+                    kdim=kdim,
+                    vdim=vdim,
+                    dropout=dropout,
+                    activation=activation,
+                    normalize_before=normalize_before,
+                )
+                for i in range(num_layers)
+            ]
+        )
+        self.norm_layers = torch.nn.ModuleList(
+            [
+                sb.nnet.normalization.LayerNorm(d_model, eps=1e-6,)
+                for i in range(num_layers)
+            ]
+        )
+
+    def forward(
+        self,
+        src,
+        src_mask: Optional[torch.Tensor] = None,
+        src_key_padding_mask: Optional[torch.Tensor] = None,
+    ):
+        """
+        Arguments
+        ----------
+        src : tensor
+            The sequence to the encoder layer (required).
+        src_mask : tensor
+            The mask for the src sequence (optional).
+        src_key_padding_mask : tensor
+            The mask for the src keys per batch (optional).
+        """
+        output = src
+        attention_lst = []
+        output_lst = []
+        for norm, enc_layer in zip(self.norm_layers, self.layers):
+            output, attention = enc_layer(
+                output,
+                src_mask=src_mask,
+                src_key_padding_mask=src_key_padding_mask,
+            )
+            attention_lst.append(attention)
+            layer_output = norm(output)
+            output_lst.append(layer_output)
+
+        return output_lst, attention_lst

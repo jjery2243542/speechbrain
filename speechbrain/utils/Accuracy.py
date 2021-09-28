@@ -153,7 +153,7 @@ class AccuracyStats:
         self.correct = 0
         self.total = 0
 
-    def append(self, log_probablities, targets, length=None):
+    def append(self, log_probabilities, targets, length=None):
         """This function is for updating the stats according to the prediction
         and target in the current batch.
 
@@ -166,7 +166,7 @@ class AccuracyStats:
         length: tensor
             Length of target (batch_size,).
         """
-        numerator, denominator = Accuracy(log_probablities, targets, length)
+        numerator, denominator = Accuracy(log_probabilities, targets, length)
         self.correct += numerator
         self.total += denominator
 
