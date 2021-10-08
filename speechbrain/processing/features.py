@@ -704,6 +704,163 @@ class Filterbank(torch.nn.Module):
         return x_db
 
 
+class InverseFilterbank(Filterbank):
+    """Inverts filter bank (FBANK) features to approximated spectral magnitudes.
+
+    Arguments
+    ---------
+     n_mels : float
+         Number of Mel filters used to average the spectrogram.
+     log_mel : bool
+         If True, it computes the log of the FBANKs.
+     filter_shape : str
+         Shape of the filters ('triangular', 'rectangular', 'gaussian').
+     f_min : int
+         Lowest frequency for the Mel filters.
+     f_max : int
+         Highest frequency for the Mel filters.
+     n_fft : int
+         Number of fft points of the STFT. It defines the frequency resolution
+         (n_fft should be<= than win_len).
+     sample_rate : int
+         Sample rate of the input audio signal (e.g, 16000)
+     power_spectrogram : float
+         Exponent used for spectrogram computation.
+     amin : float
+         Minimum amplitude (used for numerical stability).
+     ref_value : float
+         Reference value used for the dB scale.
+     top_db : float
+         Top dB valu used for log-mels.
+     freeze : bool
+         If False, it the central frequency and the band of each filter are
+         added into nn.parameters. If True, the standard frozen features
+         are computed.
+     param_change_factor: bool
+        If freeze=False, this parameter affects the speed at which the filter
+        parameters (i.e., central_freqs and bands) can be changed.  When high
+        (e.g., param_change_factor=1) the filters change a lot during training.
+        When low (e.g. param_change_factor=0.1) the filter parameters are more
+        stable during training
+     param_rand_factor: float
+        This parameter can be used to randomly change the filter parameters
+        (i.e, central frequencies and bands) during training.  It is thus a
+        sort of regularization. param_rand_factor=0 does not affect, while
+        param_rand_factor=0.15 allows random variations within +-15% of the
+        standard values of the filter parameters (e.g., if the central freq
+        is 100 Hz, we can randomly change it from 85 Hz to 115 Hz).
+
+    Example
+    -------
+    >>> import torch
+    >>> invert_fbanks = InvertFilterbank()
+    >>> inputs = torch.randn([10, 101, 40])
+    >>> outputs = invert_fbanks(inputs)
+    >>> outputs.shape
+    torch.Size([10, 101, 201])
+    """
+
+    def __init__(
+        self,
+        n_mels=40,
+        log_mel=True,
+        filter_shape="triangular",
+        f_min=0,
+        f_max=8000,
+        n_fft=400,
+        sample_rate=16000,
+        power_spectrogram=2,
+        amin=1e-10,
+        ref_value=1.0,
+        top_db=80.0,
+    ):
+        super().__init__(
+            n_mels=n_mels,
+            log_mel=log_mel,
+            filter_shape=filter_shape,
+            f_min=f_min,
+            f_max=f_max,
+            n_fft=n_fft,
+            sample_rate=sample_rate,
+            power_spectrogram=power_spectrogram,
+            amin=amin,
+            ref_value=ref_value,
+            top_db=top_db,
+            freeze=True,
+            param_change_factor=1.0,
+            param_rand_factor=0,
+        )
+
+    def forward(self, fbanks):
+        """Returns the FBANks.
+
+        Arguments
+        ---------
+        x : tensor
+            A batch of spectrogram tensors.
+        """
+        # Computing central frequency and bandwidth of each filter
+        f_central_mat = self.f_central.repeat(
+            self.all_freqs_mat.shape[1], 1
+        ).transpose(0, 1)
+        band_mat = self.band.repeat(self.all_freqs_mat.shape[1], 1).transpose(
+            0, 1
+        )
+
+        # Uncomment to print filter parameters
+        # print(self.f_central*self.sample_rate * self.param_change_factor)
+        # print(self.band*self.sample_rate* self.param_change_factor)
+
+        # Creation of the multiplication matrix. It is used to create
+        # the filters that average the computed spectrogram.
+
+        fbank_matrix = self._create_fbank_matrix(f_central_mat, band_mat).to(
+            fbanks.device
+        )
+        fbank_inverse = self._fbank_matrix_inverse(fbank_matrix)
+        fb_shape = fbanks.shape
+
+        # Managing multi-channels case (batch, time, channels)
+        if len(fb_shape) == 4:
+            fbanks = fbanks.reshape(
+                fb_shape[0] * fb_shape[3], fb_shape[1], fb_shape[2]
+            )
+
+        if self.log_mel:
+            fbanks = self._DB_to_amplitude(fbanks)
+
+        # FBANK computation
+        spectrograms = torch.matmul(fbanks, fbank_inverse)
+
+        # Reshaping in the case of multi-channel inputs
+        if len(fb_shape) == 4:
+            sp_shape = spectrograms.shape
+            spectrograms = spectrograms.reshape(
+                fb_shape[0], sp_shape[1], sp_shape[2], fb_shape[3]
+            )
+
+        return spectrograms
+
+    def _DB_to_amplitude(self, x):
+        x_amp = x + self.multiplier * self.db_multiplier
+        x_amp = x_amp / self.multiplier
+        x_amp = torch.pow(10, x_amp)
+        return x_amp
+
+    def _fbank_matrix_inverse(self, fbank_matrix):
+        m = fbank_matrix
+        m_t = fbank_matrix.transpose(0, 1)
+        p = torch.matmul(m_t, m)
+        d = torch.Tensor(
+            [
+                1.0 / x if torch.abs(x) > 1e-10 else x
+                for x in torch.sum(p, dim=0)
+            ]
+        )
+        d = d.to(fbank_matrix.device)
+        return torch.matmul(m, torch.diag(d)).transpose(0, 1)
+
+
 class DCT(torch.nn.Module):
     """Computes the discrete cosine transform.
 
