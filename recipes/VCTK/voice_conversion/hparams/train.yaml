@@ -1,0 +1,144 @@
+# ############################################################################
+# Model: VCNet
+# losses: L1
+# Training: VCTK
+# Authors:  Ju-Chieh Chou 2020
+# ############################################################################
+
+# Seed needs to be set at top of yaml, before objects with parameters are instantiated
+seed: 2602
+__set_seed: !apply:torch.manual_seed [!ref <seed>]
+output_folder: !ref results/VCNet/<seed>
+save_folder: !ref <output_folder>/save
+vc_folder: !ref <output_folder>/vc
+train_log: !ref <output_folder>/train_log.txt
+
+# Data files
+data_folder: !PLACEHOLDER # e,g./path/to/VCTK-Corpus
+dev_spks: ["p345", "p347", "p351", "p360", "p361"]
+te_spks: ["p361", "p362", "p363", "p364", "p374", "p376"]
+skip_prep: False
+train_csv: !ref <data_folder>/train.csv
+valid_csv: !ref <data_folder>/dev.csv
+
+# This is pairs of different speakers utterances generated when preparing.
+test_csv: !ref <data_folder>/pair.csv
+
+# Training parameters
+number_of_epochs: 50
+anneal_epochs: 20
+batch_size: 32
+test_batch_size: 1
+lr: 0.0005
+wd: 0.0001
+kl_weight: 0.1
+sorting: random
+
+# Feature parameters
+original_sample_rate: 48000
+sample_rate: 16000
+n_fft: 2048
+n_mels: 80
+power: 0.5
+win_length: 25
+hop_length: 10
+
+opt_class: !name:torch.optim.AdamW
+    lr: !ref <lr>
+    weight_decay: !ref <wd>
+
+
+# Dataloader options
+train_dataloader_opts:
+    batch_size: !ref <batch_size>
+
+valid_dataloader_opts:
+    batch_size: !ref <batch_size>
+
+test_dataloader_opts:
+    batch_size: !ref <test_batch_size>
+
+# Model parameters
+bank_size: 7
+n_conv_blocks: 6
+kernel_size: 3
+channels: 128
+strides: [1, 2, 1, 2, 1, 2]
+upsamples: !ref <strides>
+n_dense_blocks: 2
+
+epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
+    limit: !ref <number_of_epochs>
+
+normalize: !new:speechbrain.processing.features.InputNormalization
+    norm_type: global
+
+resample: !new:torchaudio.transforms.Resample
+    orig_freq: !ref <original_sample_rate>
+    new_freq: !ref <sample_rate>
+
+vad: !new:torchaudio.transforms.Vad
+    sample_rate: !ref <sample_rate>
+
+
+compute_STFT: !new:speechbrain.processing.features.STFT
+    sample_rate: !ref <sample_rate>
+    n_fft: !ref <n_fft>
+    win_length: !ref <win_length>
+    hop_length: !ref <hop_length>
+
+fbank: !new:speechbrain.processing.features.Filterbank
+    n_mels: !ref <n_mels>
+    sample_rate: !ref <sample_rate>
+    n_fft: !ref <n_fft>
+    power_spectrogram: !ref <power>
+
+spec_mag: !name:speechbrain.processing.features.spectral_magnitude
+    power: !ref <power>
+
+invert_fbank: !new:speechbrain.processing.features.InverseFilterbank
+    n_fft: !ref <n_fft>
+    n_mels: !ref <n_mels>
+    power_spectrogram: !ref <power>
+
+compute_ISTFT: !new:speechbrain.processing.features.ISTFT
+    sample_rate: !ref <sample_rate>
+    win_length: !ref <win_length>
+    hop_length: !ref <hop_length>
+
+resynth: !name:speechbrain.processing.signal_processing.resynthesize
+    stft: !ref <compute_STFT>
+    istft: !ref <compute_ISTFT>
+
+griffinlim: !new:torchaudio.transforms.GriffinLim
+    n_fft: !ref <n_fft>
+    win_length: !ref <sample_rate> // 1000 * <win_length>
+    hop_length: !ref <sample_rate> // 1000 * <hop_length>
+    power: 1
+
+model: !new:speechbrain.lobes.models.conv_vcnet.VCNet
+    input_shape: [null, null, !ref <n_mels>]
+    bank_size: !ref <bank_size>
+    n_conv_blocks: !ref <n_conv_blocks>
+    kernel_size: !ref <kernel_size>
+    channels: !ref <channels>
+    strides: !ref <strides>
+    upsamples: !ref <upsamples>
+    n_dense_blocks: !ref <n_dense_blocks>
+
+modules:
+    model: !ref <model>
+    normalize: !ref <normalize>
+
+
+l1_cost: !name:speechbrain.nnet.losses.l1_loss
+
+checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
+    checkpoints_dir: !ref <save_folder>
+    recoverables:
+        model: !ref <model>
+        normalizer: !ref <normalize>
+        counter: !ref <epoch_counter>
+
+train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
+    save_file: !ref <train_log>
